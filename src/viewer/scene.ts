@@ -1,5 +1,11 @@
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js'
+import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js'
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js'
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js'
+import { GTAOPass } from 'three/examples/jsm/postprocessing/GTAOPass.js'
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js'
 import { buildUnit, carcassBottom, type Part } from '../domain/builder'
 import { material } from '../domain/materials'
 import type { Project, Unit } from '../domain/types'
@@ -8,12 +14,32 @@ import { floorTexture, labelSprite, surfaceTexture } from './textures'
 /** Миллиметры сцены → метры three.js. */
 const S = 0.001
 
+/** Мягкий вертикальный градиент вместо плоской заливки — воздух вокруг сцены. */
+function gradientBackground(): THREE.Texture {
+  const canvas = document.createElement('canvas')
+  canvas.width = 4
+  canvas.height = 512
+  const ctx = canvas.getContext('2d')!
+  const grad = ctx.createLinearGradient(0, 0, 0, 512)
+  grad.addColorStop(0, '#eeebe5')
+  grad.addColorStop(0.55, '#ddd9d1')
+  grad.addColorStop(1, '#bdb8b0')
+  ctx.fillStyle = grad
+  ctx.fillRect(0, 0, 4, 512)
+  const texture = new THREE.CanvasTexture(canvas)
+  texture.mapping = THREE.EquirectangularReflectionMapping
+  texture.colorSpace = THREE.SRGBColorSpace
+  return texture
+}
+
 export type CameraPreset = 'iso' | 'front' | 'top' | 'inside'
 
 export interface ViewOptions {
   showRoom: boolean
   showDimensions: boolean
   openFronts: boolean
+  /** Ambient occlusion и сглаживание: красивее, но заметно тяжелее. */
+  realistic: boolean
 }
 
 export interface SceneCallbacks {
@@ -49,6 +75,11 @@ export class FurnitureScene {
   private roomSize = { width: 4000, depth: 3200, height: 2700 }
   private outline: THREE.LineSegments | null = null
   private frame = 0
+  private composer: EffectComposer | null = null
+  private gtao: GTAOPass | null = null
+  private realistic = false
+  private windowLight: THREE.RectAreaLight | null = null
+  private disposed = false
   private cameraTween: { from: THREE.Vector3; to: THREE.Vector3; targetFrom: THREE.Vector3; targetTo: THREE.Vector3; t: number } | null = null
   private drag: { unitId: string; offsetX: number; offsetZ: number } | null = null
   private pointerDownAt = { x: 0, y: 0, moved: false }
@@ -58,15 +89,20 @@ export class FurnitureScene {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true })
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     this.renderer.shadowMap.enabled = true
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping
-    this.renderer.toneMappingExposure = 1.05
+    this.renderer.shadowMap.type = THREE.PCFShadowMap
+    // Khronos PBR Neutral: не выжигает светлые фасады и держит цвет декора —
+    // клиент должен увидеть тот же оттенок, что выберет в каталоге.
+    this.renderer.toneMapping = THREE.NeutralToneMapping
+    this.renderer.toneMappingExposure = 1.08
     this.renderer.outputColorSpace = THREE.SRGBColorSpace
     container.appendChild(this.renderer.domElement)
 
-    this.scene.background = new THREE.Color('#e8e6e1')
-    this.camera = new THREE.PerspectiveCamera(42, 1, 0.05, 100)
+    this.scene.background = gradientBackground()
+    // Фокусное как у съёмки интерьера: меньше искажений на краях кадра.
+    this.camera = new THREE.PerspectiveCamera(35, 1, 0.05, 100)
     this.camera.position.set(3.6, 2.2, 4.6)
+
+    this.setupEnvironment()
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement)
     this.controls.enableDamping = true
@@ -91,38 +127,102 @@ export class FurnitureScene {
     this.renderer.setAnimationLoop(this.tick)
   }
 
-  private addLights() {
-    const hemi = new THREE.HemisphereLight('#ffffff', '#b9b2a6', 1.55)
-    this.scene.add(hemi)
+  /**
+   * Студийная HDR-подсветка: даёт мягкий рассеянный свет и честные отражения
+   * на глянце, столешницах и металле ручек — без неё сцена выглядит «пластиком».
+   */
+  private setupEnvironment() {
+    const pmrem = new THREE.PMREMGenerator(this.renderer)
+    const target = pmrem.fromScene(new RoomEnvironment(), 0.04)
+    this.scene.environment = target.texture
+    this.scene.environmentIntensity = 0.62
+    this.disposables.push(target, pmrem)
+  }
 
-    const key = new THREE.DirectionalLight('#fff4e6', 2.1)
-    key.position.set(4.5, 5.5, 4.2)
+  private addLights() {
+    // Окружение уже даёт заполняющий свет, поэтому направленных источников
+    // немного: одно «солнце» с тенью и слабая подсветка со стороны зрителя.
+    const ambient = new THREE.HemisphereLight('#ffffff', '#cfc7ba', 0.18)
+    this.scene.add(ambient)
+
+    const key = new THREE.DirectionalLight('#fff6ea', 2.6)
+    key.position.set(5.2, 4.4, 5.0)
+    key.target.position.set(1.4, 0.6, 0.3)
+    this.scene.add(key.target)
     key.castShadow = true
-    key.shadow.mapSize.set(2048, 2048)
+    key.shadow.mapSize.set(4096, 4096)
     key.shadow.camera.near = 0.5
-    key.shadow.camera.far = 25
-    key.shadow.camera.left = -8
-    key.shadow.camera.right = 8
-    key.shadow.camera.top = 8
-    key.shadow.camera.bottom = -8
-    key.shadow.bias = -0.0008
-    key.shadow.normalBias = 0.02
+    key.shadow.camera.far = 26
+    key.shadow.camera.left = -7
+    key.shadow.camera.right = 7
+    key.shadow.camera.top = 7
+    key.shadow.camera.bottom = -7
+    key.shadow.bias = -0.0004
+    key.shadow.normalBias = 0.015
     this.scene.add(key)
 
-    const fill = new THREE.DirectionalLight('#dde8ff', 0.55)
-    fill.position.set(-4, 3, 2.5)
-    this.scene.add(fill)
+    // Окно как источник площадью: даёт мягкое падение света по стене и по
+    // фасадам. Тени от него не считаются — за них отвечает «солнце» выше.
+    // Таблицы LTC весят ~250 КБ, поэтому грузятся отдельным чанком уже после
+    // первого кадра: сцена появляется сразу, свет доезжает следом.
+    void import('three/examples/jsm/lights/RectAreaLightUniformsLib.js').then(({ RectAreaLightUniformsLib }) => {
+      if (this.disposed) return
+      RectAreaLightUniformsLib.init()
+      const windowLight = new THREE.RectAreaLight('#e8f0ff', 5.5, 1.5, 1.9)
+      this.scene.add(windowLight)
+      this.windowLight = windowLight
+      this.placeWindowLight()
+    })
 
-    const rim = new THREE.DirectionalLight('#ffffff', 0.35)
-    rim.position.set(0, 2.5, -5)
-    this.scene.add(rim)
-
-    // Свет «от зрителя»: фасады не проваливаются в тень под любым углом обзора.
-    const front = new THREE.DirectionalLight('#ffffff', 0.5)
+    const front = new THREE.DirectionalLight('#ffffff', 0.22)
     front.position.set(0, 0.4, 1)
-    this.camera.add(front, front.target)
     front.target.position.set(0, 0, -1)
+    this.camera.add(front, front.target)
     this.scene.add(this.camera)
+  }
+
+  /**
+   * Ambient occlusion: затемняет стыки панелей, ниши и место касания пола.
+   * Именно оно отличает «коробки в пустоте» от снятого объекта. На тачскринах
+   * проход отключаем — на телефоне важнее плавность.
+   */
+  private setupComposer() {
+    if (this.composer) return
+    const size = this.renderer.getDrawingBufferSize(new THREE.Vector2())
+    const width = Math.max(size.x, 1)
+    const height = Math.max(size.y, 1)
+    const target = new THREE.WebGLRenderTarget(width, height, {
+      type: THREE.HalfFloatType,
+      samples: 4,
+    })
+    const composer = new EffectComposer(this.renderer, target)
+    composer.addPass(new RenderPass(this.scene, this.camera))
+
+    const gtao = new GTAOPass(this.scene, this.camera, width, height)
+    gtao.blendIntensity = 0.9
+    gtao.updateGtaoMaterial({
+      radius: 0.22,
+      distanceExponent: 1.4,
+      thickness: 0.4,
+      scale: 1.1,
+      samples: 10,
+      screenSpaceRadius: false,
+    })
+    composer.addPass(gtao)
+    composer.addPass(new OutputPass())
+
+    this.composer = composer
+    this.gtao = gtao
+    this.disposables.push(composer, target)
+  }
+
+  /** Окно живёт на левой стене комнаты и переезжает вместе с её размерами. */
+  private placeWindowLight() {
+    const light = this.windowLight
+    if (!light) return
+    const { depth, height } = this.roomSize
+    light.position.set(0.06, height * S * 0.58, depth * S * 0.5)
+    light.lookAt(4, height * S * 0.4, depth * S * 0.5)
   }
 
   private resize() {
@@ -131,6 +231,14 @@ export class FurnitureScene {
     this.renderer.setSize(w, h, false)
     this.camera.aspect = w / h
     this.camera.updateProjectionMatrix()
+    const buffer = this.renderer.getDrawingBufferSize(new THREE.Vector2())
+    this.composer?.setSize(w, h)
+    this.gtao?.setSize(buffer.x, buffer.y)
+  }
+
+  private draw() {
+    if (this.realistic && this.composer) this.composer.render()
+    else this.renderer.render(this.scene, this.camera)
   }
 
   // --- Публичный API ---
@@ -139,11 +247,14 @@ export class FurnitureScene {
     this.units = project.units
     this.roomSize = { width: project.room.width, depth: project.room.depth, height: project.room.height }
     this.targetOpen = options.openFronts ? 1 : 0
+    if (options.realistic && !this.composer) this.setupComposer()
+    this.realistic = options.realistic
 
     const roomSig = JSON.stringify(project.room) + String(options.showRoom)
     if (roomSig !== this.roomSignature) {
       this.roomSignature = roomSig
       this.buildRoom(project, options.showRoom)
+      this.placeWindowLight()
     }
 
     // Позиция и поворот не входят в подпись: перетаскивание не должно
@@ -171,36 +282,44 @@ export class FurnitureScene {
     this.buildHelpers(showDimensions)
   }
 
+  /**
+   * Ставит камеру так, чтобы изделие целиком попадало в кадр при любом
+   * фокусном и любых пропорциях окна: дистанция считается от габаритной сферы.
+   */
   focus(preset: CameraPreset) {
     const box = new THREE.Box3()
     if (this.unitsGroup.children.length) box.setFromObject(this.unitsGroup)
     else box.setFromCenterAndSize(new THREE.Vector3(1.5, 1, 0.3), new THREE.Vector3(3, 2, 0.6))
-    const center = box.getCenter(new THREE.Vector3())
-    const size = box.getSize(new THREE.Vector3())
-    const span = Math.max(size.x, size.y, size.z, 1)
+    const sphere = box.getBoundingSphere(new THREE.Sphere())
+    const radius = Math.max(sphere.radius, 0.4)
 
-    let position: THREE.Vector3
-    let target = center.clone()
-    switch (preset) {
-      case 'front':
-        position = new THREE.Vector3(center.x, center.y + span * 0.1, center.z + span * 1.9)
-        break
-      case 'top':
-        position = new THREE.Vector3(center.x, span * 2.4, center.z + 0.001)
-        break
-      case 'inside':
-        position = new THREE.Vector3(center.x + span * 0.35, 1.55, center.z + span * 1.05)
-        target = new THREE.Vector3(center.x, 1.2, center.z)
-        break
-      case 'iso':
-      default:
-        position = new THREE.Vector3(center.x + span * 0.95, center.y + span * 0.75, center.z + span * 1.45)
+    const vFov = THREE.MathUtils.degToRad(this.camera.fov)
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * Math.max(this.camera.aspect, 0.4))
+    const fit = Math.max(radius / Math.sin(vFov / 2), radius / Math.sin(hFov / 2))
+
+    // Направление взгляда и запас вокруг предмета — свой для каждого ракурса.
+    const setups: Record<CameraPreset, { dir: THREE.Vector3; margin: number; target: THREE.Vector3 }> = {
+      iso: { dir: new THREE.Vector3(0.8, 0.42, 1), margin: 1.12, target: sphere.center.clone() },
+      front: { dir: new THREE.Vector3(0, 0.08, 1), margin: 1.06, target: sphere.center.clone() },
+      top: { dir: new THREE.Vector3(0, 1, 0.02), margin: 1.1, target: sphere.center.clone() },
+      inside: {
+        dir: new THREE.Vector3(0.35, 0.12, 1),
+        margin: 0.72,
+        target: new THREE.Vector3(sphere.center.x, Math.min(sphere.center.y, 1.35), sphere.center.z),
+      },
     }
+    const setup = setups[preset] ?? setups.iso
+    const position = setup.target
+      .clone()
+      .add(setup.dir.normalize().multiplyScalar(fit * setup.margin))
+    // Камера не должна уходить под пол.
+    position.y = Math.max(position.y, 0.35)
+
     this.cameraTween = {
       from: this.camera.position.clone(),
       to: position,
       targetFrom: this.controls.target.clone(),
-      targetTo: target,
+      targetTo: setup.target,
       t: 0,
     }
   }
@@ -213,7 +332,7 @@ export class FurnitureScene {
     this.helpersGroup.visible = false
     this.renderer.setPixelRatio(Math.min(scale, 3))
     this.renderer.setSize(w, h, false)
-    this.renderer.render(this.scene, this.camera)
+    this.draw()
     const url = this.renderer.domElement.toDataURL('image/png')
     this.helpersGroup.visible = helpersVisible
     this.renderer.setPixelRatio(ratio)
@@ -222,6 +341,7 @@ export class FurnitureScene {
   }
 
   dispose() {
+    this.disposed = true
     this.renderer.setAnimationLoop(null)
     this.resizeObserver.disconnect()
     const el = this.renderer.domElement
@@ -264,17 +384,25 @@ export class FurnitureScene {
     floorTex.repeat.set(w / 1.2, d / 1.2)
     const floor = new THREE.Mesh(
       new THREE.PlaneGeometry(w, d),
-      new THREE.MeshStandardMaterial({ map: floorTex, roughness: floorMat.roughness, metalness: floorMat.metalness }),
+      new THREE.MeshStandardMaterial({
+        map: floorTex,
+        // Лак на полу: мебель слегка отражается — кадр перестаёт быть «чертёжным».
+        roughness: Math.max(floorMat.roughness * 0.55, 0.3),
+        metalness: 0.05,
+        envMapIntensity: 0.9,
+      }),
     )
     floor.rotation.x = -Math.PI / 2
     floor.position.set(w / 2, 0, d / 2)
     floor.receiveShadow = true
     this.roomGroup.add(floor)
 
+    // Стены — матовая краска: почти без отражений, иначе комната «блестит».
     const wallMat = new THREE.MeshStandardMaterial({
       color: new THREE.Color(project.room.wallColor),
-      roughness: 0.95,
+      roughness: 1,
       metalness: 0,
+      envMapIntensity: 0.55,
       side: THREE.DoubleSide,
     })
 
@@ -290,7 +418,7 @@ export class FurnitureScene {
     this.roomGroup.add(left)
 
     // Плинтус для ощущения комнаты
-    const skirtMat = new THREE.MeshStandardMaterial({ color: '#f4f2ee', roughness: 0.8 })
+    const skirtMat = new THREE.MeshStandardMaterial({ color: '#f6f4f0', roughness: 0.6, envMapIntensity: 0.8 })
     const skirtBack = new THREE.Mesh(new THREE.BoxGeometry(w, 0.08, 0.018), skirtMat)
     skirtBack.position.set(w / 2, 0.04, 0.009)
     this.roomGroup.add(skirtBack)
@@ -367,7 +495,10 @@ export class FurnitureScene {
         geometry = new THREE.CylinderGeometry(sx / 2, sx / 2, sy, 16)
       }
     } else {
-      geometry = new THREE.BoxGeometry(sx, sy, sz)
+      // Фаска по рёбрам: реальная деталь в кромке ловит блик на торце,
+      // острый параллелепипед сразу читается как компьютерная картинка.
+      const bevel = Math.min(0.0015, Math.min(sx, sy, sz) * 0.3)
+      geometry = new RoundedBoxGeometry(sx, sy, sz, 1, bevel)
     }
 
     const texture = surfaceTexture(mat).clone()
@@ -375,16 +506,32 @@ export class FurnitureScene {
     const dims = [sx, sy, sz].sort((a, b) => b - a)
     texture.repeat.set(Math.max(dims[0] / 0.7, 0.4), Math.max(dims[1] / 0.7, 0.4))
 
-    const meshMaterial = new THREE.MeshStandardMaterial({
-      map: texture,
-      color: new THREE.Color(mat.color),
-      roughness: mat.roughness,
-      metalness: mat.metalness,
-    })
+    const glossy = mat.roughness < 0.4
+    const meshMaterial = glossy
+      ? new THREE.MeshPhysicalMaterial({
+          map: texture,
+          color: new THREE.Color(mat.color),
+          roughness: mat.roughness,
+          metalness: mat.metalness,
+          // Лак поверх фасада или полировка камня: отражение живёт отдельно
+          // от базового цвета, поэтому глянец не выглядит «мокрым».
+          clearcoat: mat.roughness < 0.2 ? 0.9 : 0.35,
+          clearcoatRoughness: Math.max(mat.roughness, 0.06),
+          envMapIntensity: 1.1,
+        })
+      : new THREE.MeshStandardMaterial({
+          map: texture,
+          color: new THREE.Color(mat.color),
+          roughness: mat.roughness,
+          metalness: mat.metalness,
+          envMapIntensity: 0.85,
+        })
+
     if (part.role === 'handle') {
       meshMaterial.map = null
-      meshMaterial.metalness = 0.75
-      meshMaterial.roughness = 0.3
+      meshMaterial.metalness = 0.85
+      meshMaterial.roughness = 0.22
+      meshMaterial.envMapIntensity = 1.4
     }
 
     const mesh = new THREE.Mesh(geometry, meshMaterial)
@@ -551,7 +698,7 @@ export class FurnitureScene {
       if (tw.t >= 1) this.cameraTween = null
     }
 
-    this.renderer.render(this.scene, this.camera)
+    this.draw()
   }
 
   private applyOpen() {

@@ -36,11 +36,13 @@ export default function App({ initialProject, initialClientMode }: AppProps) {
   const [modal, setModal] = useState<'share' | 'offer' | null>(null)
   const [snapshot, setSnapshot] = useState<string | null>(null)
   const [toast, setToast] = useState<string | null>(null)
-  const [options, setOptions] = useState<ViewOptions>({
+  const [options, setOptions] = useState<ViewOptions>(() => ({
     showRoom: true,
     showDimensions: false,
     openFronts: false,
-  })
+    // На телефонах и планшетах тяжёлый проход выключен: важнее плавность.
+    realistic: !(window.matchMedia?.('(pointer: coarse)').matches ?? false),
+  }))
 
   const viewerRef = useRef<ViewerHandle>(null)
   const hasUnits = useRef(false)
@@ -262,7 +264,17 @@ export default function App({ initialProject, initialClientMode }: AppProps) {
                 Размеры
               </button>
             ) : null}
+            <button
+              type="button"
+              className={`pill ${options.realistic ? 'on' : ''}`}
+              title="Мягкие тени в стыках и сглаживание. Выключите, если сцена подтормаживает."
+              onClick={() => setOptions((o) => ({ ...o, realistic: !o.realistic }))}
+            >
+              Реализм
+            </button>
           </div>
+
+          <div className="vignette" aria-hidden="true" />
 
           <div className="hint no-print">
             {clientMode
