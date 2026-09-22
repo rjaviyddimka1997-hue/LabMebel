@@ -219,7 +219,10 @@ a { color: var(--accent); }
   display: flex;
   gap: 10px;
   padding: 12px 14px calc(12px + var(--safe-bottom));
-  background: linear-gradient(to top, var(--bg) 70%, transparent);
+  /* Непрозрачно: под градиентом просвечивал текст карточки, и кнопка
+     выглядела как дефект отрисовки. */
+  background: var(--bg);
+  border-top: 1px solid var(--line);
 }
 
 /* ─────────────────────────── карточки ─────────────────────────── */
@@ -348,9 +351,9 @@ a { color: var(--accent); }
   justify-content: center;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
 }
-.map-fab--locate { bottom: calc(var(--sheet-h) + 74px); }
+.map-fab--locate { bottom: calc(var(--tabbar-h) + var(--sheet-h) + 74px); }
 .map-fab--create {
-  bottom: calc(var(--sheet-h) + 12px);
+  bottom: calc(var(--tabbar-h) + var(--sheet-h) + 12px);
   background: var(--accent);
   color: var(--accent-ink);
   border-color: var(--accent);
@@ -360,7 +363,9 @@ a { color: var(--accent); }
   position: absolute;
   left: 0;
   right: 0;
-  bottom: 0;
+  /* Таб-бар перекрывает низ карты, поэтому шит останавливается над ним —
+     иначе нижняя строка карточек выезда оказывается под навигацией. */
+  bottom: calc(var(--tabbar-h) + var(--safe-bottom));
   background: var(--bg-elev);
   border-top: 1px solid var(--line);
   border-radius: 16px 16px 0 0;

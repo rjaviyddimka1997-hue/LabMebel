@@ -4,7 +4,7 @@ import 'maplibre-gl/dist/maplibre-gl.css'
 import type { LngLat, Route } from '../types'
 import type { RideListItem } from '../lib/api'
 import { DIFFICULTY } from '../lib/difficulty'
-import { bboxOf } from '../lib/geo'
+import { bboxOf, type Bbox } from '../lib/geo'
 
 const ROUTES_SOURCE = 'eh-routes'
 const RIDES_SOURCE = 'eh-rides'
@@ -25,6 +25,10 @@ const RASTER_FALLBACK: StyleSpecification = {
     },
   },
   layers: [
+    // Подложка под тайлами: если они не загрузились (нет сети в лесу,
+    // заблокирован домен), карта читается как поверхность без данных,
+    // а не как сломанный чёрный экран. Треки остаются видны.
+    { id: 'surface', type: 'background', paint: { 'background-color': '#12151b' } },
     {
       id: 'osm',
       type: 'raster',
@@ -58,11 +62,13 @@ export interface MapViewProps {
   onPickPoint?: (point: LngLat) => void
   pickedPoint?: LngLat | null
   fitToRoute?: Route | null
+  /** Разовая подгонка вида под загруженные данные; применяется один раз. */
+  fitToData?: Bbox | null
 }
 
 export function MapView({
   center, routes, rides, userPoint,
-  onRouteClick, onRideClick, onPickPoint, pickedPoint, fitToRoute,
+  onRouteClick, onRideClick, onPickPoint, pickedPoint, fitToRoute, fitToData,
 }: MapViewProps) {
   const container = useRef<HTMLDivElement | null>(null)
   const map = useRef<maplibregl.Map | null>(null)
@@ -70,6 +76,7 @@ export function MapView({
   const pickMarker = useRef<maplibregl.Marker | null>(null)
   const [ready, setReady] = useState(false)
   const [failed, setFailed] = useState(false)
+  const didFitData = useRef(false)
 
   // Обработчики держим в ref: они меняются на каждом рендере, а подписки
   // на карту вешаются один раз при инициализации.
@@ -270,10 +277,25 @@ export function MapView({
     )
   }, [fitToRoute, ready])
 
+  // Карта, открытая на фиксированном зуме, показывает один маршрут из десяти
+  // и читается как пустая. Первый кадр подгоняем под то, что реально загрузилось;
+  // дальше вид принадлежит пользователю и сам не прыгает.
   useEffect(() => {
-    if (!ready || !map.current || fitToRoute) return
+    if (!ready || !map.current || fitToRoute || didFitData.current || !fitToData) return
+    didFitData.current = true
+    map.current.fitBounds(
+      [
+        [fitToData.west, fitToData.south],
+        [fitToData.east, fitToData.north],
+      ],
+      { padding: { top: 64, bottom: 260, left: 40, right: 40 }, duration: 0, maxZoom: 11 },
+    )
+  }, [fitToData, ready, fitToRoute])
+
+  useEffect(() => {
+    if (!ready || !map.current || fitToRoute || fitToData) return
     map.current.easeTo({ center: [center.lng, center.lat], duration: 600 })
-  }, [center, ready, fitToRoute])
+  }, [center, ready, fitToRoute, fitToData])
 
   if (failed) {
     return (

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import type { Difficulty, Route, RouteFilters } from '../types'
 import { DEFAULT_RIDE_FILTERS, DEFAULT_ROUTE_FILTERS, fetchRidesNearby, fetchRoutes, type RideListItem } from '../lib/api'
 import { ALL_DIFFICULTIES, DIFFICULTY } from '../lib/difficulty'
+import { bboxOf, haversine, type Bbox } from '../lib/geo'
 import { LazyMap } from '../components/LazyMap'
 import { DifficultyLegend } from '../components/ui'
 import { RideTile } from '../components/cards'
@@ -9,6 +10,9 @@ import { useSession } from '../session'
 import { haptic } from '../lib/telegram'
 
 type Layer = 'routes' | 'rides'
+
+/** Радиус первого кадра карты: примерно день пути на эндуро с прицепом. */
+const NEARBY_FIT_RADIUS_M = 300_000
 
 /**
  * Главный экран — карта, а не лента: эндуро географичен, человек мыслит
@@ -66,6 +70,21 @@ export function MapScreen({
     )
   }
 
+  // Первый кадр карты показывает данные вокруг пользователя, а не всё сразу:
+  // при подгонке под весь набор Карелия и Петербург растягивают вид на тысячу
+  // километров, и подмосковный кластер схлопывается в неразличимые точки.
+  const dataBounds = useMemo<Bbox | null>(() => {
+    const all: [number, number][] = [
+      ...routes.flatMap((route) => route.coordinates),
+      ...rides.map((ride): [number, number] => [ride.meetingPoint.lng, ride.meetingPoint.lat]),
+    ]
+    const near = all.filter(
+      ([lng, lat]) => haversine(center, { lng, lat }) <= NEARBY_FIT_RADIUS_M,
+    )
+    const points = near.length > 1 ? near : all
+    return points.length > 1 ? bboxOf(points) : null
+  }, [routes, rides, center])
+
   const visibleRoutes = layers.includes('routes') ? routes : []
   const visibleRides = useMemo(
     () =>
@@ -119,6 +138,7 @@ export function MapScreen({
           userPoint={userPoint}
           onRouteClick={onOpenRoute}
           onRideClick={onOpenRide}
+          fitToData={userPoint ? null : dataBounds}
         />
         <DifficultyLegend />
 
